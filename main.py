@@ -41,6 +41,8 @@ from forecasting_tools import (
     structure_output,
 )
 
+from rate_limit import ThrottledLlm
+
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -717,30 +719,34 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=True,
         # Models pinned explicitly (10 Nov 2026) because the library's built-in
         # defaults point at OpenAI models that OpenRouter no longer serves.
+        # The forecasting model is throttled to 15 requests per minute because
+        # OpenRouter caps new accounts at 20 per minute on it (see rate_limit.py).
+        # allowed_tries=4 lets a stray "rate limited" reply retry after a pause.
         llms={
-            "default": GeneralLlm(
+            "default": ThrottledLlm(
                 model="openrouter/anthropic/claude-sonnet-5.5",
+                requests_per_minute=15,
                 temperature=0.3,
                 timeout=180,
-                allowed_tries=2,
+                allowed_tries=4,
             ),
             "summarizer": GeneralLlm(
                 model="openrouter/anthropic/claude-haiku-5.5",
                 temperature=0.3,
                 timeout=90,
-                allowed_tries=2,
+                allowed_tries=4,
             ),
             "researcher": GeneralLlm(
                 model="openrouter/perplexity/sonar-pro",
                 temperature=0.1,
                 timeout=180,
-                allowed_tries=2,
+                allowed_tries=4,
             ),
             "parser": GeneralLlm(
                 model="openrouter/anthropic/claude-haiku-5.5",
                 temperature=0.3,
                 timeout=90,
-                allowed_tries=2,
+                allowed_tries=4,
             ),
         },
     )
