@@ -128,6 +128,82 @@ class FallTemplateBot2026(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
+    ##################################### FORECASTER ROSTER #####################################
+    # The forecasts for each question are dealt out in turn across up to three
+    # models from different vendors ("default", "forecaster_2", "forecaster_3").
+    # With 6 predictions per question and 3 models, each model forecasts twice
+    # and the published forecast is the median, so no single model's blind spot
+    # decides the answer. If a model fails, the next vendor's model takes its turn.
+
+    _FORECASTER_PURPOSES = ("default", "forecaster_2", "forecaster_3")
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._forecaster_turns: dict[str, int] = {}
+
+    @classmethod
+    def _llm_config_defaults(cls) -> dict[str, str | GeneralLlm | None]:
+        defaults = super()._llm_config_defaults()
+        defaults.setdefault("forecaster_2", None)
+        defaults.setdefault("forecaster_3", None)
+        return defaults
+
+    def _forecaster_roster(self) -> list[GeneralLlm]:
+        roster: list[GeneralLlm] = []
+        for purpose in self._FORECASTER_PURPOSES:
+            if self._llms.get(purpose) is not None:
+                roster.append(self.get_llm(purpose, "llm"))
+        return roster
+
+    async def _invoke_forecaster(self, question: MetaculusQuestion, prompt: str) -> str:
+        roster = self._forecaster_roster()
+        key = question.page_url or str(question.id_of_question)
+        turn = self._forecaster_turns.get(key, 0)
+        self._forecaster_turns[key] = turn + 1
+        size = len(roster)
+        start = turn % size
+        candidates = [roster[start]]  # this turn's model
+        if size > 1:
+            # One backup from another vendor, alternating so a vendor outage
+            # does not hand all of its turns to the same replacement.
+            lap = turn // size
+            candidates.append(roster[(start + 1 + lap % (size - 1)) % size])
+        last_error: Exception | None = None
+        for llm in candidates:
+            try:
+                reasoning = await llm.invoke(prompt)
+                return f"*Forecaster model: {llm.model}*\n\n{reasoning}"
+            except Exception as error:  # noqa: BLE001 - any failure moves on to the backup model
+                last_error = error
+                logger.warning(
+                    f"Forecaster model {llm.model} failed on {question.page_url}: "
+                    f"{type(error).__name__}: {str(error)[:300]}"
+                )
+        assert last_error is not None
+        raise last_error
+
+    ##################################### PROMPT BUILDING BLOCKS #####################################
+
+    _RESOLUTION_STEP = (
+        "Restate in your own words exactly what has to happen, by what deadline, and according to which source, "
+        "for each possible outcome. Point out anything in the criteria or fine print that would stop an "
+        "apparently-qualifying event from counting, and any edge cases."
+    )
+    _OUTSIDE_VIEW_STEP = (
+        "The outside view: name a reference class of similar past situations and say roughly how often each "
+        "outcome occurred (the base rate), before considering the specifics of this case."
+    )
+    _INSIDE_VIEW_STEP = (
+        "The inside view: the specific evidence in the research that should move you away from the base rate, "
+        "noting how recent and how reliable each key item is. If the research is thin, out of date, or silent on "
+        "a key point, say so and stay closer to the base rate."
+    )
+    _DISCIPLINE_NOTE = (
+        "Your forecast is judged against the exact resolution criteria as written, not against the headline of the question. "
+        "The research may be incomplete or out of date, so check the date of each fact you rely on. "
+        "The question is still open: never answer that it has already been decided, always give a forecast."
+    )
+
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
@@ -179,13 +255,27 @@ class FallTemplateBot2026(ForecastBot):
             To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
             You do not produce forecasts yourself.
 
+            Today is {datetime.now().strftime("%Y-%m-%d")}.
+
             Question:
             {question.question_text}
+
+            Background:
+            {question.background_info}
 
             This question's outcome will be determined by the specific criteria below:
             {question.resolution_criteria}
 
             {question.fine_print}
+
+            Cover each of the following, and give the date of every fact you report:
+            1. Where things stand right now against the exact resolution criteria, using the most recent reports you can find.
+            2. If the criteria name a data source or a number, the latest published value from that source and when it was published.
+            3. Scheduled events, decisions or data releases between today and the deadline that could change the outcome.
+            4. How often similar events have happened in comparable past situations (base rates), with figures where available.
+            5. Current odds on this or a closely related question from prediction markets (Polymarket, Kalshi, Manifold), if any exist, with the date seen.
+            6. Any reports that conflict with each other.
+            Finish with a short list of important things you looked for and could not find.
             """
         )
         return prompt
@@ -217,13 +307,19 @@ class FallTemplateBot2026(ForecastBot):
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
+            {self._DISCIPLINE_NOTE}
+
             Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A brief description of a scenario that results in a No outcome.
-            (d) A brief description of a scenario that results in a Yes outcome.
+            (a) {self._RESOLUTION_STEP}
+            (b) The time left until the outcome to the question is known.
+            (c) {self._OUTSIDE_VIEW_STEP}
+            (d) The status quo outcome if nothing changed.
+            (e) {self._INSIDE_VIEW_STEP}
+            (f) A brief description of a scenario that results in a No outcome.
+            (g) A brief description of a scenario that results in a Yes outcome.
 
             You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
+            You are scored with a logarithmic rule against other forecasters, so being confidently wrong costs far more than being cautiously right earns. Give a probability below 3% or above 97% only when the outcome is all but settled by facts already in hand.
             {self._get_conditional_disclaimer_if_necessary(question)}
 
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
@@ -237,7 +333,7 @@ class FallTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecaster(question, prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -287,10 +383,15 @@ class FallTemplateBot2026(ForecastBot):
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
+            {self._DISCIPLINE_NOTE}
+
             Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A description of a scenario that results in an unexpected outcome.
+            (a) {self._RESOLUTION_STEP}
+            (b) The time left until the outcome to the question is known.
+            (c) {self._OUTSIDE_VIEW_STEP}
+            (d) The status quo outcome if nothing changed.
+            (e) {self._INSIDE_VIEW_STEP}
+            (f) A description of a scenario that results in an unexpected outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
@@ -319,7 +420,7 @@ class FallTemplateBot2026(ForecastBot):
             {self._create_resolved_question_parsing_message()}
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecaster(question, prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning,
@@ -373,13 +474,20 @@ class FallTemplateBot2026(ForecastBot):
             - Never use scientific notation.
             - Always start with a smaller number (more negative if negative) and then increase from there. The value for percentile 10 should always be less than the value for percentile 20, and so on.
 
+            {self._DISCIPLINE_NOTE}
+
             Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
-            (c) The outcome if the current trend continued.
-            (d) The expectations of experts and markets.
-            (e) A brief description of an unexpected scenario that results in a low outcome.
-            (f) A brief description of an unexpected scenario that results in a high outcome.
+            (a) {self._RESOLUTION_STEP} State the exact quantity being asked for, its units and scale, and check them against the bounds given above.
+            (b) The time left until the outcome to the question is known.
+            (c) The most recent known value and its date, and any part of the outcome that is already fixed (for example a running total that can only grow).
+            (d) {self._OUTSIDE_VIEW_STEP} For a quantity, this means how much it has typically moved over a period this long.
+            (e) The outcome if nothing changed.
+            (f) The outcome if the current trend continued.
+            (g) The expectations of experts and markets.
+            (h) A brief description of an unexpected scenario that results in a low outcome.
+            (i) A brief description of an unexpected scenario that results in a high outcome.
+
+            Your 10th and 90th percentiles should be far enough apart that you would expect the outcome to fall outside them about 1 time in 5.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
@@ -402,7 +510,7 @@ class FallTemplateBot2026(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecaster(question, prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -468,13 +576,20 @@ class FallTemplateBot2026(ForecastBot):
             - Always start with a lower date chronologically and then increase from there.
             - Do NOT forget this. The dates must be written in chronological order starting at the earliest time at percentile 10 and increasing from there.
 
+            {self._DISCIPLINE_NOTE}
+
             Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
-            (c) The outcome if the current trend continued.
-            (d) The expectations of experts and markets.
-            (e) A brief description of an unexpected scenario that results in a low outcome.
-            (f) A brief description of an unexpected scenario that results in a high outcome.
+            (a) {self._RESOLUTION_STEP} State the exact quantity being asked for, its units and scale, and check them against the bounds given above.
+            (b) The time left until the outcome to the question is known.
+            (c) The most recent known value and its date, and any part of the outcome that is already fixed (for example a running total that can only grow).
+            (d) {self._OUTSIDE_VIEW_STEP} For a quantity, this means how much it has typically moved over a period this long.
+            (e) The outcome if nothing changed.
+            (f) The outcome if the current trend continued.
+            (g) The expectations of experts and markets.
+            (h) A brief description of an unexpected scenario that results in a low outcome.
+            (i) A brief description of an unexpected scenario that results in a high outcome.
+
+            Your 10th and 90th percentiles should be far enough apart that you would expect the outcome to fall outside them about 1 time in 5.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
@@ -498,7 +613,7 @@ class FallTemplateBot2026(ForecastBot):
         question: DateQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._invoke_forecaster(question, prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -709,27 +824,33 @@ if __name__ == "__main__":
     # Configure the bot. The `llms=` block below is commented out to use
     # whichever default models forecasting-tools picks based on your env vars;
     # uncomment and edit to pin specific models.
+    # Forecasting models: one flagship from each of three vendors, all at high
+    # reasoning effort (Metaculus found high-reasoning variants beat standard
+    # ones in every pair it tested). Each is held to 15 requests per minute
+    # because OpenRouter caps new accounts at 20 per minute (see rate_limit.py).
+    # Model names were checked against OpenRouter's live model list on 10 Nov 2026;
+    # the library's built-in defaults point at models OpenRouter no longer serves.
+    def make_forecaster(model: str) -> ThrottledLlm:
+        return ThrottledLlm(
+            model=model,
+            requests_per_minute=15,
+            reasoning_effort="high",
+            timeout=480,
+            allowed_tries=2,
+        )
+
     template_bot = FallTemplateBot2026(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=6,  # 2 per forecasting model
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # Models pinned explicitly (10 Nov 2026) because the library's built-in
-        # defaults point at OpenAI models that OpenRouter no longer serves.
-        # The forecasting model is throttled to 15 requests per minute because
-        # OpenRouter caps new accounts at 20 per minute on it (see rate_limit.py).
-        # allowed_tries=4 lets a stray "rate limited" reply retry after a pause.
         llms={
-            "default": ThrottledLlm(
-                model="openrouter/anthropic/claude-sonnet-5.5",
-                requests_per_minute=15,
-                temperature=0.3,
-                timeout=180,
-                allowed_tries=4,
-            ),
+            "default": make_forecaster("openrouter/anthropic/claude-sonnet-5.5"),
+            "forecaster_2": make_forecaster("openrouter/openai/gpt-6.1-sol"),
+            "forecaster_3": make_forecaster("openrouter/google/gemini-4-argon"),
             "summarizer": GeneralLlm(
                 model="openrouter/anthropic/claude-haiku-5.5",
                 temperature=0.3,
