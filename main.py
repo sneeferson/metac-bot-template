@@ -715,17 +715,34 @@ if __name__ == "__main__":
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        # Models pinned explicitly (10 Nov 2026) because the library's built-in
+        # defaults point at OpenAI models that OpenRouter no longer serves.
+        llms={
+            "default": GeneralLlm(
+                model="openrouter/anthropic/claude-sonnet-5.5",
+                temperature=0.3,
+                timeout=180,
+                allowed_tries=2,
+            ),
+            "summarizer": GeneralLlm(
+                model="openrouter/anthropic/claude-haiku-5.5",
+                temperature=0.3,
+                timeout=90,
+                allowed_tries=2,
+            ),
+            "researcher": GeneralLlm(
+                model="openrouter/perplexity/sonar-pro",
+                temperature=0.1,
+                timeout=180,
+                allowed_tries=2,
+            ),
+            "parser": GeneralLlm(
+                model="openrouter/anthropic/claude-haiku-5.5",
+                temperature=0.3,
+                timeout=90,
+                allowed_tries=2,
+            ),
+        },
     )
 
     # Per-mode tournament URL shown in the summary banner footer. These
