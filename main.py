@@ -146,6 +146,7 @@ class FallTemplateBot2026(ForecastBot):
         defaults = super()._llm_config_defaults()
         defaults.setdefault("forecaster_2", None)
         defaults.setdefault("forecaster_3", None)
+        defaults.setdefault("researcher_2", None)
         return defaults
 
     def _forecaster_roster(self) -> list[GeneralLlm]:
@@ -207,9 +208,52 @@ class FallTemplateBot2026(ForecastBot):
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
+        """Runs the main researcher and, if one is configured, a second
+        independent researcher at the same time, and joins their reports.
+        If one of them fails, the other's report is used on its own."""
         async with self._concurrency_limiter:
+            researchers = [self.get_llm("researcher")]
+            if self._llms.get("researcher_2") is not None:
+                researchers.append(self.get_llm("researcher_2"))
+            results = await asyncio.gather(
+                *[self._run_single_research(question, r) for r in researchers],
+                return_exceptions=True,
+            )
+            reports: list[str] = []
+            for researcher, result in zip(researchers, results):
+                name = GeneralLlm.to_model_name(researcher)
+                if isinstance(result, BaseException):
+                    logger.warning(
+                        f"Researcher {name} failed on {question.page_url}: "
+                        f"{type(result).__name__}: {str(result)[:300]}"
+                    )
+                elif result and result.strip():
+                    reports.append(result)
+            if not reports:
+                first_error = next((r for r in results if isinstance(r, BaseException)), None)
+                if first_error is not None:
+                    raise first_error
+                research = ""
+            elif len(reports) == 1:
+                research = reports[0]
+            else:
+                research = (
+                    "Two assistants researched this independently using different search tools. "
+                    "Where they disagree, prefer the more recent and better-sourced claim, and treat a point "
+                    "that only one of them found as less certain.\n\n"
+                    + "\n\n".join(
+                        f"### Research report {number}\n{report}"
+                        for number, report in enumerate(reports, start=1)
+                    )
+                )
+            logger.info(f"Found Research for URL {question.page_url}:\n{research}")
+            return research
+
+    async def _run_single_research(
+        self, question: MetaculusQuestion, researcher: str | GeneralLlm
+    ) -> str:
+        if True:  # keeps the original template block below at its original indentation
             research = ""
-            researcher = self.get_llm("researcher")
 
             prompt = self._get_research_prompt(question, researcher)
 
@@ -237,8 +281,7 @@ class FallTemplateBot2026(ForecastBot):
             elif not researcher or researcher == "None" or researcher == "no_research":
                 research = ""
             else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
-            logger.info(f"Found Research for URL {question.page_url}:\n{research}")
+                research = await GeneralLlm(model=researcher).invoke(prompt)
             return research
 
     @staticmethod
@@ -862,6 +905,15 @@ if __name__ == "__main__":
                 temperature=0.1,
                 timeout=180,
                 allowed_tries=4,
+            ),
+            # Second, independent research pass on a different search stack
+            # (OpenRouter's web-search plugin on a GPT model) so the forecasters
+            # are not relying on a single search provider's view.
+            "researcher_2": ThrottledLlm(
+                model="openrouter/openai/gpt-6.1-sol:online",
+                requests_per_minute=10,
+                timeout=240,
+                allowed_tries=2,
             ),
             "parser": GeneralLlm(
                 model="openrouter/anthropic/claude-haiku-5.5",
