@@ -1,0 +1,30 @@
+name: Coverage report
+
+# Read-only check of which recent tournament questions the bot forecast and
+# which it missed. Makes no forecasts and no model calls, so it costs nothing.
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "How many days back to look"
+        default: "7"
+
+jobs:
+  coverage_job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
+        with:
+          version: "0.13.1"
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Print coverage report
+        run: uv run python coverage_report.py --days "${{ inputs.days }}"
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
